@@ -1,4 +1,14 @@
-
+# advanced_signals.py
+# 자동 업데이트 대상:
+# 1) 하이퍼스케일러 CAPEX: SEC companyfacts 기반 보고 TTM CAPEX
+#    - cash PP&E + finance lease additions where tagged
+#    - 2026E analyst guidance/projection과는 다릅니다.
+# 2) Nvidia 가이던스: SEC 8-K / 실적발표 문서 파싱
+# 3) 한국 반도체 수출: 관세청 HS8541+8542 프록시
+#    - 공식 산업부/무역협회 MTI831 “반도체”와 다를 수 있어 기본 weight=0입니다.
+#    - USE_SEMI_HS_PROXY=true 를 설정할 때만 종합점수에 포함됩니다.
+# 4) Forward EPS: FMP analyst estimates 기반 watchlist proxy
+# 5) EPS Revision Ratio: FMP EPS estimate 전회 대비 변화 기반 proxy
 
 from __future__ import annotations
 
@@ -36,10 +46,21 @@ HYPERSCALERS = {
 }
 
 # 회사마다 태그명이 조금 다를 수 있어 후보를 여러 개 둡니다.
+# Cash PP&E / productive asset payments. Amazon은 productive assets 태그를 많이 사용합니다.
 CAPEX_TAGS = [
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
     "CapitalExpenditures",
+]
+
+# AI 데이터센터 CAPEX는 현금 PP&E 외에 finance lease / ROU asset 취득이 중요할 수 있습니다.
+# SEC XBRL 태그는 회사별로 다르기 때문에 가능한 후보를 더합니다.
+FINANCE_LEASE_TAGS = [
+    "RightOfUseAssetObtainedInExchangeForFinanceLeaseLiability",
+    "FinanceLeaseRightOfUseAssetObtainedInExchangeForFinanceLeaseLiability",
+    "FinanceLeaseRightOfUseAssetObtainedInExchangeForFinanceLeaseLiabilities",
+    "AssetsObtainedInExchangeForFinanceLeaseLiabilities",
+    "PropertyPlantAndEquipmentObtainedInExchangeForFinanceLeaseLiabilities",
 ]
 
 DEFAULT_EPS_SYMBOLS = [
@@ -294,22 +315,58 @@ def fact_quarterly_series(facts: dict[str, Any], tag: str) -> pd.Series:
     return s2 if len(s2) > len(s) else s
 
 
-def company_capex_series(cik: str) -> pd.Series:
-    facts = companyfacts(cik)
+def _best_series_for_tags(facts: dict[str, Any], tags: list[str]) -> tuple[pd.Series, str | None]:
     best = pd.Series(dtype=float)
     best_tag = None
-
-    for tag in CAPEX_TAGS:
+    for tag in tags:
         s = fact_quarterly_series(facts, tag)
         if len(s) > len(best):
             best = s
             best_tag = tag
+    if best_tag:
+        best.name = best_tag
+    return best, best_tag
+
+
+def company_cash_capex_series(cik: str) -> pd.Series:
+    facts = companyfacts(cik)
+    best, best_tag = _best_series_for_tags(facts, CAPEX_TAGS)
 
     if len(best) < 6:
-        raise RuntimeError(f"CIK {cik}: CAPEX 태그 데이터를 충분히 찾지 못했습니다.")
+        raise RuntimeError(f"CIK {cik}: cash CAPEX 태그 데이터를 충분히 찾지 못했습니다.")
 
     best.name = best_tag
     return best
+
+
+def company_finance_lease_series(cik: str) -> pd.Series:
+    """SEC XBRL에서 finance lease / ROU asset additions를 찾습니다.
+
+    없는 회사도 많습니다. 없으면 빈 Series를 반환하고, cash CAPEX만 사용합니다.
+    """
+    facts = companyfacts(cik)
+    best, best_tag = _best_series_for_tags(facts, FINANCE_LEASE_TAGS)
+    if best_tag:
+        best.name = best_tag
+    return best
+
+
+def company_capex_series(cik: str) -> pd.Series:
+    """보고 TTM CAPEX용 회사별 시계열.
+
+    cash PP&E/productive assets에 finance lease additions가 SEC 태그로 잡히면 더합니다.
+    이 값은 과거 보고치 기반이며, 애널리스트의 2026E CAPEX 전망치가 아닙니다.
+    """
+    cash = company_cash_capex_series(cik)
+    leases = company_finance_lease_series(cik)
+
+    if len(leases) >= 3:
+        combined = cash.add(leases, fill_value=0.0).sort_index()
+        combined.name = f"{cash.name}+finance_leases"
+        return combined
+
+    cash.name = f"{cash.name}"
+    return cash
 
 
 def _aggregate_capex_item(series_by_ticker: list[tuple[str, pd.Series]], source_label: str) -> dict[str, Any]:
@@ -360,13 +417,20 @@ def _aggregate_capex_item(series_by_ticker: list[tuple[str, pd.Series]], source_
     risk = 50 - last_yoy * 90 + max(0.0, -delta) * 140
     trend_z = -delta * 10
 
-    value = f"가중 TTM YoY {last_yoy:+.1%}, TTM ${total_ttm / 1e9:.1f}B ({len(records)}/{len(HYPERSCALERS)}개사)"
-    change = f"{source_label}, 전분기 YoY 변화 {delta:+.1%}p"
+    # 이 값은 회사 실적/현금흐름표 기준의 실제 trailing-twelve-month CAPEX입니다.
+    # Goldman/CreditSights/TrendForce 등에서 말하는 2026E AI CAPEX 전망치와는 정의가 다릅니다.
+    # 메시지에 회사별 TTM breakdown을 같이 넣어 이상치를 바로 볼 수 있게 합니다.
+    breakdown = ", ".join(
+        f"{r['ticker']} ${r['ttm_latest'] / 1e9:.0f}B"
+        for r in sorted(records, key=lambda x: x["ttm_latest"], reverse=True)
+    )
+    value = f"실적 TTM 총액 ${total_ttm / 1e9:.1f}B, 가중 YoY {last_yoy:+.1%} ({len(records)}/{len(HYPERSCALERS)}개사)"
+    change = f"{source_label} actual TTM, 2026E/가이던스 아님; 전분기 YoY 변화 {delta:+.1%}p; {breakdown}"
     if failed:
         change += f"; 일부 제외 {len(failed)}개"
 
     return make_item(
-        name="하이퍼스케일러 CAPEX",
+        name="하이퍼스케일러 CAPEX 실적 TTM",
         value=value,
         risk=risk,
         trend_z=trend_z,
@@ -390,27 +454,31 @@ def hyperscaler_capex_item_sec() -> dict[str, Any]:
     if len(series_by_ticker) < 3:
         raise RuntimeError("SEC CAPEX 수집 실패: " + "; ".join(failed[:6]))
 
-    return _aggregate_capex_item(series_by_ticker, source_label="SEC companyfacts")
+    return _aggregate_capex_item(series_by_ticker, source_label="SEC reported cash PP&E+leases")
 
 def hyperscaler_capex_item() -> dict[str, Any]:
     """하이퍼스케일러 CAPEX.
 
-    FMP cash-flow-statement의 quarterly capitalExpenditure를 우선 사용합니다.
-    FMP가 안 되면 SEC companyfacts 방식으로 fallback합니다.
-    """
-    fmp_error = None
-    try:
-        return hyperscaler_capex_item_fmp()
-    except Exception as e:
-        fmp_error = e
+    v6 기준 source-of-truth는 SEC companyfacts입니다. FMP cash-flow-statement는
+    finance lease / ROU additions를 누락할 수 있고 회사별 정의가 달라서 기본 사용하지
+    않습니다.
 
+    주의: 이 값은 "보고 TTM"입니다. CreditSights/Epoch/Goldman 등에서 말하는
+    2026E hyperscaler capex forecast와 직접 비교하면 안 됩니다.
+    """
     try:
         return hyperscaler_capex_item_sec()
     except Exception as sec_error:
-        raise RuntimeError(
-            "FMP CAPEX 실패(" + sanitize_error(fmp_error) + "); "
-            "SEC CAPEX 실패(" + sanitize_error(sec_error) + ")"
-        )
+        # SEC가 일시 실패했을 때만 명시적으로 허용한 경우 FMP fallback을 사용합니다.
+        if os.getenv("ALLOW_FMP_CAPEX_FALLBACK", "").lower() in {"1", "true", "yes", "y"}:
+            try:
+                return hyperscaler_capex_item_fmp()
+            except Exception as fmp_error:
+                raise RuntimeError(
+                    "SEC CAPEX 실패(" + sanitize_error(sec_error) + "); "
+                    "FMP CAPEX fallback 실패(" + sanitize_error(fmp_error) + ")"
+                )
+        raise RuntimeError("SEC CAPEX 실패(" + sanitize_error(sec_error) + ")")
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1038,9 @@ def korea_semiconductor_exports_item() -> dict[str, Any]:
     all_rows = []
     chunk_errors = []
 
-    # 8541: 반도체 디바이스, 8542: 집적회로. 반도체 수출 프록시로 합산합니다.
+    # 8541: 반도체 디바이스, 8542: 집적회로.
+    # 주의: 이 값은 관세청 HS 8541+8542 합산 프록시입니다.
+    # 산업부 보도자료의 공식 "반도체 수출" 분류(MTI/품목 통계)와 1:1로 같지 않을 수 있습니다.
     for hs in ["8541", "8542"]:
         for start_p, end_p in _month_chunks(start_period, end_period, max_months=12):
             start_ym = start_p.strftime("%Y%m")
@@ -1010,16 +1080,24 @@ def korea_semiconductor_exports_item() -> dict[str, Any]:
     risk = 55 - yoy * 120 + max(0.0, -delta) * 80
     trend_z = -delta * 8
 
-    value = f"{last_m} YoY {yoy:+.1%}, ${s.loc[last_m] / 1e9:.2f}B"
-    change = f"전월 YoY 대비 {delta:+.1%}p"
+    include_proxy = os.getenv("USE_SEMI_HS_PROXY", "").lower() in {"1", "true", "yes", "y"}
+    weight = 10 if include_proxy else 0
+
+    value = f"HS8541+8542 {last_m} YoY {yoy:+.1%}, ${s.loc[last_m] / 1e9:.2f}B"
+    change = (
+        f"전월 YoY 대비 {delta:+.1%}p; "
+        "관세청 HS 품목 프록시, 공식 MTI831 반도체 수출액 아님"
+    )
+    if not include_proxy:
+        change += "; 기본값은 종합점수 미반영(USE_SEMI_HS_PROXY=true 시 반영)"
 
     return make_item(
-        name="반도체 수출 YoY",
+        name="반도체 수출 프록시(HS8541+8542)",
         value=value,
         risk=risk,
         trend_z=trend_z,
         asof=str(last_m),
-        weight=10,
+        weight=weight,
         change=change,
     )
 
