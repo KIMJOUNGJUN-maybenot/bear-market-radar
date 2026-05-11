@@ -44,4 +44,3 @@ jobs:
           git add data/*.csv data/sec_cache/*.json || true
           git diff --cached --quiet || git commit -m "Update bear market radar data"
           git push
-
