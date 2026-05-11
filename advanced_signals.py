@@ -539,6 +539,13 @@ def _fmp_request(url: str, params: dict[str, Any]) -> Any:
     params = dict(params)
     params["apikey"] = fmp_key()
     r = requests.get(url, params=params, timeout=30)
+
+    # FMP 무료/저가 플랜에서 analyst-estimates가 403으로 막히는 경우가 흔합니다.
+    # 긴 URL과 종목별 반복 오류를 Telegram에 뿌리지 않도록 짧게 정리합니다.
+    if r.status_code in (401, 403):
+        endpoint = url.replace("https://financialmodelingprep.com", "")
+        raise RuntimeError(f"FMP 권한 오류 {r.status_code}: {endpoint}")
+
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict):
@@ -948,22 +955,41 @@ def call_kcs_itemtrade(hs_code: str, start_ym: str, end_ym: str) -> list[dict[st
     raise RuntimeError("관세청 GW API 호출/파싱 실패: " + sanitize_error(msg))
 
 
+def _month_chunks(start_period: pd.Period, end_period: pd.Period, max_months: int = 12) -> list[tuple[pd.Period, pd.Period]]:
+    """관세청 GW API는 시작~종료 조회기간을 1년 이내로 제한합니다.
+    YoY 계산에는 13개월 이상이 필요하므로 여러 번 나눠 호출합니다.
+    """
+    chunks: list[tuple[pd.Period, pd.Period]] = []
+    cur = start_period
+    while cur <= end_period:
+        chunk_end = min(cur + (max_months - 1), end_period)
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + 1
+    return chunks
+
+
 def korea_semiconductor_exports_item() -> dict[str, Any]:
     today = pd.Timestamp.today()
     end_period = (today - pd.DateOffset(months=1)).to_period("M")
     start_period = end_period - 25
 
-    start_ym = start_period.strftime("%Y%m")
-    end_ym = end_period.strftime("%Y%m")
-
     all_rows = []
+    chunk_errors = []
+
     # 8541: 반도체 디바이스, 8542: 집적회로. 반도체 수출 프록시로 합산합니다.
     for hs in ["8541", "8542"]:
-        rows = call_kcs_itemtrade(hs, start_ym, end_ym)
-        all_rows.extend(rows)
+        for start_p, end_p in _month_chunks(start_period, end_period, max_months=12):
+            start_ym = start_p.strftime("%Y%m")
+            end_ym = end_p.strftime("%Y%m")
+            try:
+                rows = call_kcs_itemtrade(hs, start_ym, end_ym)
+                all_rows.extend(rows)
+            except Exception as e:
+                chunk_errors.append(f"HS{hs} {start_ym}-{end_ym}: {sanitize_error(e)}")
 
     if not all_rows:
-        raise RuntimeError("반도체 수출 데이터를 가져오지 못했습니다.")
+        detail = " | ".join(chunk_errors[:4]) if chunk_errors else "응답 데이터 없음"
+        raise RuntimeError("반도체 수출 데이터를 가져오지 못했습니다: " + detail)
 
     df = pd.DataFrame(all_rows)
     s = df.groupby("month")["expDlr"].sum().sort_index()
@@ -1053,8 +1079,33 @@ def forward_eps_revision_items() -> list[dict[str, Any]]:
             continue
 
     if not current_rows:
-        detail = "; ".join(symbol_errors[:5]) if symbol_errors else "원인 로그 없음"
-        raise RuntimeError("FMP Forward EPS 데이터를 가져오지 못했습니다. FMP_API_KEY가 analyst-estimates endpoint 접근 권한이 있는지 확인하세요. " + detail)
+        # FMP analyst-estimates는 키/플랜에 따라 403으로 막힐 수 있습니다.
+        # 봇 전체를 실패시키지 않고, 해당 20점 비중을 커버리지에서 제외합니다.
+        detail = "; ".join(symbol_errors[:2]) if symbol_errors else "원인 로그 없음"
+        short_reason = "FMP analyst-estimates 접근 불가"
+        if "403" in detail or "권한 오류" in detail:
+            short_reason = "FMP 플랜/권한 부족"
+
+        return [
+            make_item(
+                name="Forward EPS",
+                value=short_reason,
+                risk=50,
+                trend_z=0,
+                asof=today,
+                weight=0,
+                change="자동수집 제외: FMP 권한 필요",
+            ),
+            make_item(
+                name="EPS Revision Ratio",
+                value=short_reason,
+                risk=50,
+                trend_z=0,
+                asof=today,
+                weight=0,
+                change="자동수집 제외: FMP 권한 필요",
+            ),
+        ]
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current = pd.DataFrame(current_rows)
