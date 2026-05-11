@@ -1,1 +1,761 @@
 
+# advanced_signals.py
+import os
+import re
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+
+DATA_DIR = Path("data")
+EPS_HISTORY_PATH = DATA_DIR / "eps_estimates_history.csv"
+NVDA_GUIDANCE_HISTORY_PATH = DATA_DIR / "nvda_guidance_history.csv"
+
+SEC_DATA = "https://data.sec.gov"
+SEC_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
+
+HYPERSCALERS = {
+    "MSFT": "0000789019",
+    "GOOGL": "0001652044",
+    "META": "0001326801",
+    "AMZN": "0001018724",
+    "ORCL": "0001341439",
+}
+
+CAPEX_TAGS = [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+    "CapitalExpenditures",
+]
+
+DEFAULT_EPS_SYMBOLS = [
+    "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META",
+    "AVGO", "AMD", "TSM", "ASML", "ORCL", "MU", "QCOM", "CRM", "NOW"
+]
+
+
+def clip(x, lo, hi):
+    return float(max(lo, min(hi, x)))
+
+
+def status_emoji(risk):
+    if risk >= 70:
+        return "🔴"
+    if risk >= 55:
+        return "🟠"
+    if risk >= 35:
+        return "🟡"
+    return "🟢"
+
+
+def trend_arrow(trend_z):
+    if trend_z > 0.35:
+        return "▲"
+    if trend_z < -0.35:
+        return "▼"
+    return "→"
+
+
+def make_item(name, value, risk, trend_z, asof, weight, change="자동수집"):
+    risk = clip(risk, 0, 100)
+    trend_z = clip(trend_z, -3, 3)
+
+    return {
+        "name": name,
+        "value": str(value),
+        "risk": risk,
+        "trend_z": trend_z,
+        "arrow": trend_arrow(trend_z),
+        "status": status_emoji(risk),
+        "change": change,
+        "asof": str(asof),
+        "weight": float(weight),
+    }
+
+
+def require_env(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} 환경변수가 필요합니다.")
+    return value
+
+
+def sec_headers():
+    ua = require_env("SEC_USER_AGENT")
+    return {
+        "User-Agent": ua,
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+def sec_json(url):
+    time.sleep(0.12)
+    r = requests.get(url, headers=sec_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def sec_text(url):
+    time.sleep(0.12)
+    r = requests.get(url, headers=sec_headers(), timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+def companyfacts(cik):
+    cik10 = str(cik).zfill(10)
+    return sec_json(f"{SEC_DATA}/api/xbrl/companyfacts/CIK{cik10}.json")
+
+
+def fact_series_for_tag(facts, tag):
+    rows = []
+    units = (
+        facts.get("facts", {})
+        .get("us-gaap", {})
+        .get(tag, {})
+        .get("units", {})
+        .get("USD", [])
+    )
+
+    for x in units:
+        frame = x.get("frame") or ""
+        m = re.fullmatch(r"CY(\d{4})Q([1-4])", frame)
+        if not m:
+            continue
+
+        val = x.get("val")
+        if val is None:
+            continue
+
+        period = pd.Period(f"{m.group(1)}Q{m.group(2)}", freq="Q")
+        rows.append(
+            {
+                "date": period.end_time.normalize(),
+                "filed": pd.to_datetime(x.get("filed", "1900-01-01")),
+                "val": abs(float(val)),
+            }
+        )
+
+    if not rows:
+        return pd.Series(dtype=float)
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["date", "filed"]).drop_duplicates("date", keep="last")
+    return pd.Series(df["val"].values, index=pd.to_datetime(df["date"])).sort_index()
+
+
+def company_capex_series(cik):
+    facts = companyfacts(cik)
+
+    for tag in CAPEX_TAGS:
+        s = fact_series_for_tag(facts, tag)
+        if len(s) >= 8:
+            return s
+
+    raise RuntimeError(f"CIK {cik}: CAPEX 태그를 찾지 못했습니다.")
+
+
+def hyperscaler_capex_item():
+    series = []
+
+    for ticker, cik in HYPERSCALERS.items():
+        s = company_capex_series(cik)
+        series.append(s.rename(ticker))
+
+    df = pd.concat(series, axis=1).sort_index()
+    total_q = df.sum(axis=1, min_count=3).dropna()
+
+    if len(total_q) < 8:
+        raise RuntimeError("하이퍼스케일러 CAPEX 분기 데이터가 부족합니다.")
+
+    ttm = total_q.rolling(4).sum().dropna()
+    yoy = (ttm / ttm.shift(4) - 1).dropna()
+
+    if len(yoy) < 2:
+        raise RuntimeError("하이퍼스케일러 CAPEX YoY 계산 데이터가 부족합니다.")
+
+    last_yoy = float(yoy.iloc[-1])
+    prev_yoy = float(yoy.iloc[-2])
+    delta = last_yoy - prev_yoy
+
+    # CAPEX YoY가 높고 개선되면 위험 낮음, 둔화/마이너스면 위험 상승
+    risk = 55 - last_yoy * 100 + max(0, -delta) * 120
+    trend_z = (prev_yoy - last_yoy) * 8
+
+    value = f"TTM YoY {last_yoy:+.1%}, TTM ${ttm.iloc[-1] / 1e9:.1f}B"
+    change = f"전분기 YoY 변화 {delta:+.1%}p"
+
+    return make_item(
+        name="하이퍼스케일러 CAPEX",
+        value=value,
+        risk=risk,
+        trend_z=trend_z,
+        asof=yoy.index[-1].strftime("%Y-%m-%d"),
+        weight=15,
+        change=change,
+    )
+
+
+def html_to_text(raw_html):
+    soup = BeautifulSoup(raw_html, "html.parser")
+    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+
+
+def parse_revenue_guidance(text):
+    lower = text.lower()
+    idx = lower.find("outlook")
+
+    if idx >= 0:
+        window = text[idx: idx + 6000]
+    else:
+        window = text
+
+    patterns = [
+        r"revenue\s+is\s+expected\s+to\s+be\s+(?:approximately\s+)?\$?\s*([0-9]+(?:\.[0-9]+)?)\s*(billion|million)",
+        r"revenue\s+.*?expected\s+.*?\$?\s*([0-9]+(?:\.[0-9]+)?)\s*(billion|million)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, window, flags=re.IGNORECASE)
+        if m:
+            num = float(m.group(1))
+            unit = m.group(2).lower()
+            return num * 1e9 if unit == "billion" else num * 1e6
+
+    return None
+
+
+def latest_nvda_guidance_from_sec():
+    cik = "0001045810"
+    sub = sec_json(f"{SEC_DATA}/submissions/CIK{cik}.json")
+    recent = sub["filings"]["recent"]
+
+    forms = recent["form"]
+    accs = recent["accessionNumber"]
+    dates = recent["filingDate"]
+
+    candidates = [
+        (form, acc, date)
+        for form, acc, date in zip(forms, accs, dates)
+        if form == "8-K"
+    ][:15]
+
+    for _, acc, filing_date in candidates:
+        acc_no_dash = acc.replace("-", "")
+        index_url = f"{SEC_ARCHIVES}/1045810/{acc_no_dash}/index.json"
+
+        try:
+            index = sec_json(index_url)
+        except Exception:
+            continue
+
+        files = index.get("directory", {}).get("item", [])
+
+        html_files = [
+            f["name"]
+            for f in files
+            if f["name"].lower().endswith((".htm", ".html"))
+        ]
+
+        # 실적 보도자료는 보통 exhibit 99.1 또는 8-K html에 포함됩니다.
+        preferred = [
+            name for name in html_files
+            if "ex99" in name.lower() or "8-k" in name.lower()
+        ] + html_files
+
+        for name in preferred:
+            url = f"{SEC_ARCHIVES}/1045810/{acc_no_dash}/{name}"
+
+            try:
+                text = html_to_text(sec_text(url))
+            except Exception:
+                continue
+
+            guide = parse_revenue_guidance(text)
+
+            if guide:
+                return {
+                    "filing_date": filing_date,
+                    "accession": acc,
+                    "revenue_guidance": guide,
+                }
+
+    raise RuntimeError("NVIDIA 최신 8-K에서 Revenue Outlook을 찾지 못했습니다.")
+
+
+def append_history(path, row, keys):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    new = pd.DataFrame([row])
+
+    if path.exists():
+        old = pd.read_csv(path)
+        out = pd.concat([old, new], ignore_index=True)
+    else:
+        out = new
+
+    out = out.drop_duplicates(keys, keep="last")
+    out.to_csv(path, index=False)
+
+
+def fmp_json(endpoint, params):
+    key = require_env("FMP_API_KEY")
+    params = dict(params)
+    params["apikey"] = key
+
+    url = f"https://financialmodelingprep.com/stable/{endpoint}"
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+
+    data = r.json()
+    if isinstance(data, dict) and "Error Message" in data:
+        raise RuntimeError(data["Error Message"])
+
+    return data
+
+
+def pick_number(row, candidates):
+    for c in candidates:
+        if c in row and row[c] not in (None, "", "None"):
+            try:
+                return float(row[c])
+            except Exception:
+                pass
+    return None
+
+
+def fmp_revenue_estimate(symbol):
+    rows = fmp_json("analyst-estimates", {"symbol": symbol})
+
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    for row in rows:
+        rev = pick_number(
+            row,
+            [
+                "estimatedRevenueAvg",
+                "revenueAvg",
+                "revenueAverage",
+                "estimatedRevenue",
+            ],
+        )
+        if rev and rev > 0:
+            return rev
+
+    return None
+
+
+def nvda_guidance_item():
+    latest = latest_nvda_guidance_from_sec()
+
+    append_history(
+        NVDA_GUIDANCE_HISTORY_PATH,
+        {
+            "filing_date": latest["filing_date"],
+            "accession": latest["accession"],
+            "revenue_guidance": latest["revenue_guidance"],
+        },
+        keys=["filing_date", "accession"],
+    )
+
+    hist = pd.read_csv(NVDA_GUIDANCE_HISTORY_PATH)
+    hist = hist.sort_values("filing_date")
+    latest_guide = float(hist.iloc[-1]["revenue_guidance"])
+
+    qoq = None
+    if len(hist) >= 2:
+        prev_guide = float(hist.iloc[-2]["revenue_guidance"])
+        if prev_guide > 0:
+            qoq = latest_guide / prev_guide - 1
+
+    consensus_gap = None
+    try:
+        consensus = fmp_revenue_estimate("NVDA")
+        if consensus and consensus > 0:
+            consensus_gap = latest_guide / consensus - 1
+    except Exception:
+        consensus = None
+
+    if consensus_gap is not None:
+        risk = 50 - consensus_gap * 600
+        trend_z = -consensus_gap * 12
+        compare_text = f"컨센서스 대비 {consensus_gap:+.1%}"
+    elif qoq is not None:
+        risk = 50 - qoq * 120
+        trend_z = -qoq * 6
+        compare_text = f"직전 가이던스 대비 {qoq:+.1%}"
+    else:
+        risk = 50
+        trend_z = 0
+        compare_text = "비교 기준 수집 중"
+
+    value = f"Revenue guide ${latest_guide / 1e9:.1f}B"
+    change = compare_text
+
+    return make_item(
+        name="Nvidia 가이던스",
+        value=value,
+        risk=risk,
+        trend_z=trend_z,
+        asof=latest["filing_date"],
+        weight=10,
+        change=change,
+    )
+
+
+def parse_export_xml(xml_text):
+    root = ET.fromstring(xml_text)
+    rows = []
+
+    def node_text(node, name):
+        child = node.find(name)
+        return child.text.strip() if child is not None and child.text else None
+
+    for item in root.findall(".//item"):
+        year = node_text(item, "year")
+        if not year:
+            continue
+
+        m = re.search(r"(\d{4})\.?(\d{2})", year)
+        if not m:
+            continue
+
+        hs_code = node_text(item, "hsCode") or ""
+        stat_kor = node_text(item, "statKor") or ""
+        exp_dlr = node_text(item, "expDlr")
+
+        if not exp_dlr:
+            continue
+
+        # 총계/중복 행 제외
+        if year == "총계" or hs_code == "-" or stat_kor == "-":
+            continue
+
+        value = float(str(exp_dlr).replace(",", ""))
+
+        rows.append(
+            {
+                "month": pd.Period(f"{m.group(1)}-{m.group(2)}", freq="M"),
+                "hsCode": hs_code,
+                "expDlr": value,
+            }
+        )
+
+    return rows
+
+
+def call_kcs_itemtrade(hs_code, start_ym, end_ym):
+    key = require_env("DATA_GO_KR_SERVICE_KEY")
+
+    # 신형 data.go.kr Gateway
+    new_url = "https://apis.data.go.kr/1220000/Itemtrade/getItemtradeList"
+    new_params = {
+        "serviceKey": key,
+        "strtYymm": start_ym,
+        "endYymm": end_ym,
+        "hsSgn": hs_code,
+    }
+
+    try:
+        r = requests.get(new_url, params=new_params, timeout=30)
+        r.raise_for_status()
+        rows = parse_export_xml(r.content)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    # 구형 관세청 endpoint fallback
+    old_url = "https://openapi.customs.go.kr/openapi/service/newTradestatistics/getitemtradeList"
+    old_params = {
+        "serviceKey": key,
+        "searchBgnDe": start_ym,
+        "searchEndDe": end_ym,
+        "searchItemCd": hs_code,
+    }
+
+    r = requests.get(old_url, params=old_params, timeout=30)
+    r.raise_for_status()
+    return parse_export_xml(r.content)
+
+
+def korea_semiconductor_exports_item():
+    today = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None)
+
+    # 관세청 데이터는 전월 데이터가 매월 중순경 안정화되므로 넉넉히 26개월 조회
+    end_period = (today - pd.DateOffset(months=1)).to_period("M")
+    start_period = end_period - 25
+
+    start_ym = start_period.strftime("%Y%m")
+    end_ym = end_period.strftime("%Y%m")
+
+    all_rows = []
+
+    # 8541: 반도체 디바이스, 8542: 집적회로. 실전용 반도체 수출 프록시.
+    for hs in ["8541", "8542"]:
+        rows = call_kcs_itemtrade(hs, start_ym, end_ym)
+        all_rows.extend(rows)
+
+    if not all_rows:
+        raise RuntimeError("관세청 반도체 수출 데이터를 가져오지 못했습니다.")
+
+    df = pd.DataFrame(all_rows)
+    s = df.groupby("month")["expDlr"].sum().sort_index()
+
+    s = s[s > 0]
+
+    if len(s) < 14:
+        raise RuntimeError("반도체 수출 YoY 계산 데이터가 부족합니다.")
+
+    last_m = s.index[-1]
+    prev12_m = last_m - 12
+
+    if prev12_m not in s.index:
+        raise RuntimeError("전년동월 데이터가 없어 YoY 계산을 할 수 없습니다.")
+
+    yoy = s.loc[last_m] / s.loc[prev12_m] - 1
+
+    prev_yoy = 0.0
+    if len(s) >= 15:
+        prev_m = last_m - 1
+        prev_m_12 = prev_m - 12
+        if prev_m in s.index and prev_m_12 in s.index:
+            prev_yoy = s.loc[prev_m] / s.loc[prev_m_12] - 1
+
+    delta = yoy - prev_yoy
+
+    risk = 55 - yoy * 120 + max(0, -delta) * 80
+    trend_z = (prev_yoy - yoy) * 8
+
+    value = f"{last_m} YoY {yoy:+.1%}, ${s.loc[last_m] / 1e9:.2f}B"
+    change = f"전월 YoY 대비 {delta:+.1%}p"
+
+    return make_item(
+        name="반도체 수출 YoY",
+        value=value,
+        risk=risk,
+        trend_z=trend_z,
+        asof=str(last_m),
+        weight=10,
+        change=change,
+    )
+
+
+def fmp_forward_eps(symbol):
+    rows = fmp_json("analyst-estimates", {"symbol": symbol})
+
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    for row in rows:
+        eps = pick_number(
+            row,
+            [
+                "estimatedEpsAvg",
+                "epsAvg",
+                "epsAverage",
+                "estimatedEps",
+            ],
+        )
+        revenue = pick_number(
+            row,
+            [
+                "estimatedRevenueAvg",
+                "revenueAvg",
+                "revenueAverage",
+                "estimatedRevenue",
+            ],
+        )
+
+        if eps is not None:
+            return {
+                "symbol": symbol,
+                "eps": eps,
+                "revenue": revenue,
+            }
+
+    return None
+
+
+def fmp_market_cap(symbol):
+    try:
+        rows = fmp_json("quote", {"symbol": symbol})
+        if isinstance(rows, list) and rows:
+            mc = pick_number(rows[0], ["marketCap"])
+            if mc and mc > 0:
+                return mc
+    except Exception:
+        pass
+
+    return 1.0
+
+
+def forward_eps_revision_items():
+    symbols = os.getenv("EPS_SYMBOLS")
+    if symbols:
+        watchlist = [x.strip().upper() for x in symbols.split(",") if x.strip()]
+    else:
+        watchlist = DEFAULT_EPS_SYMBOLS
+
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+    current_rows = []
+
+    for symbol in watchlist:
+        try:
+            est = fmp_forward_eps(symbol)
+            if not est:
+                continue
+
+            current_rows.append(
+                {
+                    "run_date": today,
+                    "symbol": symbol,
+                    "eps": est["eps"],
+                    "revenue": est["revenue"],
+                    "marketCap": fmp_market_cap(symbol),
+                }
+            )
+
+            time.sleep(0.05)
+
+        except Exception:
+            continue
+
+    if not current_rows:
+        raise RuntimeError("FMP Forward EPS 데이터를 가져오지 못했습니다.")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    current = pd.DataFrame(current_rows)
+
+    if EPS_HISTORY_PATH.exists():
+        hist = pd.read_csv(EPS_HISTORY_PATH)
+    else:
+        hist = pd.DataFrame(columns=["run_date", "symbol", "eps", "revenue", "marketCap"])
+
+    previous = hist[hist["run_date"] < today].copy()
+
+    # 먼저 현재 스냅샷 저장
+    out = pd.concat([hist, current], ignore_index=True)
+    out = out.drop_duplicates(["run_date", "symbol"], keep="last")
+    out.to_csv(EPS_HISTORY_PATH, index=False)
+
+    if previous.empty:
+        neutral_1 = make_item(
+            name="Forward EPS",
+            value=f"기준값 수집 시작 ({len(current)} symbols)",
+            risk=50,
+            trend_z=0,
+            asof=today,
+            weight=10,
+            change="첫 실행/기준값 저장",
+        )
+
+        neutral_2 = make_item(
+            name="EPS Revision Ratio",
+            value=f"기준값 수집 시작 ({len(current)} symbols)",
+            risk=50,
+            trend_z=0,
+            asof=today,
+            weight=10,
+            change="첫 실행/기준값 저장",
+        )
+
+        return [neutral_1, neutral_2]
+
+    prev_latest = (
+        previous.sort_values("run_date")
+        .groupby("symbol")
+        .tail(1)
+        .rename(columns={"eps": "eps_prev", "marketCap": "marketCap_prev"})
+    )
+
+    joined = current.merge(
+        prev_latest[["symbol", "eps_prev", "marketCap_prev"]],
+        on="symbol",
+        how="inner",
+    )
+
+    joined = joined[
+        (joined["eps"] > 0)
+        & (joined["eps_prev"] > 0)
+    ].copy()
+
+    if joined.empty:
+        raise RuntimeError("Forward EPS 비교 가능한 이전 데이터가 없습니다.")
+
+    joined["pct"] = joined["eps"] / joined["eps_prev"] - 1
+    weights = joined["marketCap"].astype(float).clip(lower=1.0)
+
+    avg_change = float(np.average(joined["pct"], weights=weights))
+
+    threshold = 0.0005
+    up = joined[joined["pct"] > threshold]
+    down = joined[joined["pct"] < -threshold]
+
+    up_w = float(up["marketCap"].sum())
+    down_w = float(down["marketCap"].sum())
+
+    if up_w + down_w > 0:
+        revision_ratio = (up_w - down_w) / (up_w + down_w)
+    else:
+        revision_ratio = 0.0
+
+    eps_risk = 50 - avg_change * 1000
+    eps_trend_z = -avg_change * 100
+
+    rev_risk = 50 - revision_ratio * 40
+    rev_trend_z = -revision_ratio * 2
+
+    forward_eps_item = make_item(
+        name="Forward EPS",
+        value=f"Watchlist EPS 변화 {avg_change:+.2%}",
+        risk=eps_risk,
+        trend_z=eps_trend_z,
+        asof=today,
+        weight=10,
+        change=f"전회 대비, {len(joined)} symbols",
+    )
+
+    revision_item = make_item(
+        name="EPS Revision Ratio",
+        value=f"{revision_ratio:+.2f} | 상향 {len(up)} / 하향 {len(down)}",
+        risk=rev_risk,
+        trend_z=rev_trend_z,
+        asof=today,
+        weight=10,
+        change="전회 대비 EPS 상향/하향 비율",
+    )
+
+    return [forward_eps_item, revision_item]
+
+
+def fetch_advanced_items():
+    items = []
+    errors = []
+
+    fetchers = [
+        hyperscaler_capex_item,
+        nvda_guidance_item,
+        korea_semiconductor_exports_item,
+    ]
+
+    for fn in fetchers:
+        try:
+            items.append(fn())
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {e}")
+
+    try:
+        items.extend(forward_eps_revision_items())
+    except Exception as e:
+        errors.append(f"forward_eps_revision_items: {e}")
+
+    return items, errors
