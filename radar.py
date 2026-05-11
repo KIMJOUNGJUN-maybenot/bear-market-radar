@@ -252,16 +252,35 @@ def load_advanced_signals_csv(path: Path = ADVANCED_CSV_PATH) -> list[dict[str, 
 
 
 def dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """자동수집값을 먼저 넣고 CSV 백업값은 같은 이름이면 무시합니다."""
-    seen = set()
-    out = []
+    """같은 이름의 지표가 중복될 때 정리합니다.
+
+    원칙:
+    - 자동수집 성공값(weight > 0)은 CSV 백업값보다 우선합니다.
+    - 자동수집 실패로 만들어진 placeholder(weight == 0)는 CSV 백업값(weight > 0)이 있으면 교체합니다.
+      예: FMP 권한 부족으로 Forward EPS가 제외됐지만 advanced_signals.csv에 수동값이 있으면 수동값 사용.
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
     for item in items:
-        name = item.get("name")
-        if not name or name in seen:
+        name = str(item.get("name", "")).strip()
+        if not name:
             continue
-        seen.add(name)
-        out.append(item)
-    return out
+
+        if name not in by_name:
+            by_name[name] = item
+            order.append(name)
+            continue
+
+        old = by_name[name]
+        old_w = float(old.get("weight", 0))
+        new_w = float(item.get("weight", 0))
+
+        # 기존 값이 placeholder이고 새 값이 실제 가중치가 있으면 새 값으로 교체합니다.
+        if old_w <= 0 < new_w:
+            by_name[name] = item
+
+    return [by_name[name] for name in order]
 
 
 def compute_score(items: list[dict[str, Any]]) -> tuple[float, float, float]:
@@ -386,7 +405,13 @@ def render_message(
     delta_label: str,
 ) -> str:
     now = kst_now().strftime("%Y-%m-%d %H:%M")
-    movers = sorted(items, key=lambda x: abs(float(x["trend_z"])), reverse=True)[:3]
+
+    # weight=0 지표는 FMP 권한 부족처럼 "수집 실패/자동 제외"된 항목입니다.
+    # 이런 항목은 종합점수와 방향성에 들어가지 않고, 별도 섹션에만 표시합니다.
+    active_items = [x for x in items if float(x.get("weight", 0)) > 0]
+    excluded_items = [x for x in items if float(x.get("weight", 0)) <= 0]
+
+    movers = sorted(active_items, key=lambda x: abs(float(x["trend_z"])), reverse=True)[:3]
     direction = direction_text(delta_n, direction_z)
 
     lines = [
@@ -398,19 +423,23 @@ def render_message(
         f"<b>전회 변화:</b> {format_delta(delta_1)}",
         f"<b>{html.escape(delta_label)}:</b> {format_delta(delta_n)}",
         f"<b>데이터 커버리지:</b> {coverage:.0f}/100",
+        "<b>주의:</b> 커버리지가 100 미만이면 제외 지표는 종합점수에 반영되지 않습니다.",
         "",
         "<b>핵심 변화 Top 3</b>",
     ]
 
-    for i, x in enumerate(movers, 1):
-        lines.append(
-            f"{i}) {x['arrow']} {html.escape(str(x['name']))}: "
-            f"{html.escape(str(x['value']))} | {html.escape(str(x['change']))} | 위험 {float(x['risk']):.0f}"
-        )
+    if movers:
+        for i, x in enumerate(movers, 1):
+            lines.append(
+                f"{i}) {x['arrow']} {html.escape(str(x['name']))}: "
+                f"{html.escape(str(x['value']))} | {html.escape(str(x['change']))} | 위험 {float(x['risk']):.0f}"
+            )
+    else:
+        lines.append("수집된 활성 지표가 없습니다.")
 
     lines += ["", "<b>지표별 체크</b>"]
 
-    for x in sorted(items, key=lambda y: float(y["weight"]), reverse=True):
+    for x in sorted(active_items, key=lambda y: float(y["weight"]), reverse=True):
         lines.append(
             f"{x['status']} {x['arrow']} <b>{html.escape(str(x['name']))}</b>: "
             f"{html.escape(str(x['value']))} | {html.escape(str(x['change']))} "
@@ -418,12 +447,21 @@ def render_message(
         )
 
     missing = max(0.0, 100.0 - coverage)
-    if missing > 0:
+    if missing > 0 or excluded_items:
         lines += [
             "",
-            f"⚠️ <b>미연결 지표 비중:</b> {missing:.0f}/100",
-            "필수 API 키가 없거나 일부 데이터 수집이 실패하면 커버리지가 낮아집니다.",
+            f"⚠️ <b>미연결/제외 지표 비중:</b> {missing:.0f}/100",
+            "아래 제외 지표는 종합점수·방향성 계산에 포함되지 않습니다.",
         ]
+
+    if excluded_items:
+        lines += ["", "<b>제외 지표</b>"]
+        for x in excluded_items:
+            lines.append(
+                f"- <b>{html.escape(str(x['name']))}</b>: "
+                f"{html.escape(str(x['value']))} | {html.escape(str(x['change']))} "
+                f"| 기준 {html.escape(str(x['asof']))}"
+            )
 
     if errors:
         lines += ["", "<b>데이터 오류/누락</b>"]
@@ -432,8 +470,8 @@ def render_message(
         if len(errors) > 8:
             lines.append(f"- 외 {len(errors) - 8}개")
 
-    # 한 줄 결론
-    high_risk_names = [str(x["name"]) for x in items if float(x["risk"]) >= 60]
+    # 한 줄 결론: 제외 지표는 고위험 지표 판단에서도 제외합니다.
+    high_risk_names = [str(x["name"]) for x in active_items if float(x["risk"]) >= 60]
     if score >= 55 and direction == "하락장에 가까워지는 중":
         conclusion = "복수 핵심 지표가 악화되어 하락장 접근 신호가 강해지고 있습니다."
     elif direction == "하락장에서 멀어지는 중":
@@ -445,6 +483,9 @@ def render_message(
 
     if high_risk_names:
         conclusion += " 고위험 지표: " + ", ".join(high_risk_names[:4]) + "."
+
+    if excluded_items:
+        conclusion += " 단, 제외 지표가 있어 커버리지 기준으로 해석해야 합니다."
 
     lines += ["", f"<b>한 줄 결론:</b> {html.escape(conclusion)}"]
 
@@ -561,8 +602,8 @@ def main() -> None:
     specs = [
         # name, fetcher, higher_is_risk, weight, window, value_format, change_kind
         ("HY Spread", lambda: fred_series("BAMLH0A0HYM2"), True, 15, 20, "{:.2f}%", "bps"),
-        ("미국 10Y 실질금리", lambda: fred_series("DFII10"), True, 8, 20, "{:.2f}%", "bps"),
-        ("달러지수 프록시", lambda: fred_series("DTWEXBGS"), True, 7, 20, "{:.2f}", "pct"),
+        ("미국 10Y TIPS 실질금리(DFII10)", lambda: fred_series("DFII10"), True, 8, 20, "{:.2f}%", "bps"),
+        ("광의 달러지수(DTWEXBGS)", lambda: fred_series("DTWEXBGS"), True, 7, 20, "{:.2f}", "pct"),
         ("원/달러", lambda: fred_series("DEXKOUS"), True, 7, 20, "{:,.0f}원", "pct"),
         ("제조업 경기 프록시(IPMAN YoY)", fred_manufacturing_activity_proxy, False, 4, 3, "{:+.2f}%", "pp"),
         ("미국 실업률", lambda: fred_series("UNRATE"), True, 4, 3, "{:.1f}%", "pp"),
