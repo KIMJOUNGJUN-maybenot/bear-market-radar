@@ -107,95 +107,31 @@ def fred_series(series_id: str, start: str = "2018-01-01") -> pd.Series:
     return s.dropna().sort_index()
 
 
-FRED_MD_PAGE_URL = "https://www.stlouisfed.org/research/economists/mccracken/fred-databases"
-FRED_MD_FALLBACK_URLS = [
-    "https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md/monthly/current.csv",
-    "https://files.stlouisfed.org/files/htdocs/fred-md/monthly/current.csv",
-]
+# ---------------------------------------------------------------------------
+# Data fetchers: Manufacturing activity proxy
+# ---------------------------------------------------------------------------
 
 
-def _http_headers() -> dict[str, str]:
-    # stlouisfed.org / files.stlouisfed.org 쪽은 GitHub Actions의 기본 user-agent를
-    # 차단하는 경우가 있어 명시적으로 넣습니다. SEC_USER_AGENT가 있으면 재사용합니다.
-    ua = os.getenv("SEC_USER_AGENT") or "bearmarket-radar/1.0 contact@example.com"
-    return {
-        "User-Agent": ua,
-        "Accept": "text/csv,application/csv,text/plain,text/html,*/*",
-    }
+def fred_manufacturing_activity_proxy() -> pd.Series:
+    """Public proxy for the removed ISM PMI series.
 
+    Important:
+    - Exact ISM Manufacturing PMI data is not available in current FRED/FRED-MD.
+    - FRED-MD removed the ISM/NAPM series from current vintages after ISM asked
+      FRED to remove those series.
+    - To keep this bot fully automatic without a paid/licensed ISM feed, we use
+      FRED's Industrial Production: Manufacturing (NAICS), IPMAN, transformed to
+      YoY percent change. Lower YoY growth means higher recession/bear-market risk.
 
-def _read_fred_md_csv_from_url(url: str) -> pd.DataFrame:
-    r = requests.get(url, headers=_http_headers(), timeout=30)
-    r.raise_for_status()
-    return pd.read_csv(io.StringIO(r.text))
-
-
-def _discover_latest_fred_md_csv_url() -> str | None:
-    """St. Louis Fed의 FRED-MD 페이지에서 최신 monthly csv 링크를 찾습니다."""
-    try:
-        r = requests.get(FRED_MD_PAGE_URL, headers=_http_headers(), timeout=30)
-        r.raise_for_status()
-        html_text = r.text
-    except Exception:
-        return None
-
-    candidates: list[str] = []
-
-    # 절대 URL
-    candidates.extend(re.findall(r'https?://[^"\']+fred-md/monthly/[^"\']+?\.csv', html_text))
-
-    # 상대 URL: /-/media/project/frbstl/stlouisfed/research/fred-md/monthly/2026-04-md.csv
-    for rel in re.findall(r'href=["\']([^"\']+fred-md/monthly/[^"\']+?\.csv)', html_text):
-        if rel.startswith("http"):
-            candidates.append(rel)
-        elif rel.startswith("/"):
-            candidates.append("https://www.stlouisfed.org" + rel)
-
-    # current.csv가 있으면 우선, 없으면 최신 월별 파일 우선
-    for url in candidates:
-        if "current" in url.lower():
-            return url
-
-    dated = []
-    for url in candidates:
-        m = re.search(r'(20\d{2})-(\d{2})', url)
-        if m:
-            dated.append((m.group(0), url))
-    if dated:
-        return sorted(dated, reverse=True)[0][1]
-
-    return candidates[0] if candidates else None
-
-
-def fred_ism_pmi() -> pd.Series:
-    """ISM Manufacturing PMI Composite Index.
-
-    FRED API의 NAPM series_id는 일반 FRED series endpoint에서 400이 날 수 있습니다.
-    그래서 St. Louis Fed의 FRED-MD monthly csv에서 NAPM 컬럼을 읽습니다.
+    This is NOT the same as ISM PMI. It is a public manufacturing-cycle proxy.
     """
-    errors: list[str] = []
-    urls = list(FRED_MD_FALLBACK_URLS)
-    discovered = _discover_latest_fred_md_csv_url()
-    if discovered:
-        urls.insert(0, discovered)
+    raw = fred_series("IPMAN")
+    yoy = raw.pct_change(12).dropna() * 100.0
 
-    seen = set()
-    for url in urls:
-        if url in seen:
-            continue
-        seen.add(url)
-        try:
-            df = _read_fred_md_csv_from_url(url)
-            if "sasdate" not in df.columns or "NAPM" not in df.columns:
-                raise RuntimeError("FRED-MD CSV에 sasdate 또는 NAPM 컬럼이 없습니다.")
-            df["sasdate"] = pd.to_datetime(df["sasdate"], errors="coerce")
-            df = df.dropna(subset=["sasdate"])
-            s = pd.Series(pd.to_numeric(df["NAPM"], errors="coerce").values, index=df["sasdate"])
-            return s.dropna().sort_index()
-        except Exception as e:
-            errors.append(f"{url}: {sanitize_error(e)}")
+    if len(yoy) < 24:
+        raise RuntimeError("IPMAN YoY 제조업 프록시 계산 데이터가 부족합니다.")
 
-    raise RuntimeError("FRED-MD NAPM 다운로드 실패: " + " | ".join(errors[:3]))
+    return yoy.sort_index()
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +439,7 @@ def render_message(
     elif direction == "하락장에서 멀어지는 중":
         conclusion = "최근 변화 기준으로는 하락장 압력이 완화되고 있습니다."
     elif score >= 35:
-        conclusion = "경계 구간입니다. 크레딧, 달러, 고용·PMI, 이익 리비전 방향을 계속 확인해야 합니다."
+        conclusion = "경계 구간입니다. 크레딧, 달러, 고용·제조업, 이익 리비전 방향을 계속 확인해야 합니다."
     else:
         conclusion = "현재 수집 지표 기준으로는 하락장과 거리가 있습니다."
 
@@ -520,9 +456,33 @@ def render_message(
 # ---------------------------------------------------------------------------
 
 
-def _send_telegram_chunk(text: str) -> None:
+def telegram_chat_ids() -> list[str]:
+    """Return one or more Telegram chat IDs.
+
+    Preferred secret for multiple recipients:
+        TELEGRAM_CHAT_IDS="123456789,-987654321,@my_channel"
+
+    Backward-compatible single-recipient secret:
+        TELEGRAM_CHAT_ID="123456789"
+    """
+    raw = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID") or ""
+    ids = [x.strip() for x in re.split(r"[,;\n]+", raw) if x.strip()]
+
+    if not ids:
+        raise RuntimeError("TELEGRAM_CHAT_IDS 또는 TELEGRAM_CHAT_ID가 없습니다.")
+
+    # 중복 제거, 순서 유지
+    seen: set[str] = set()
+    unique: list[str] = []
+    for chat_id in ids:
+        if chat_id not in seen:
+            seen.add(chat_id)
+            unique.append(chat_id)
+    return unique
+
+
+def _send_telegram_chunk_to_chat(text: str, chat_id: str) -> None:
     token = require_env("TELEGRAM_BOT_TOKEN")
-    chat_id = require_env("TELEGRAM_CHAT_ID")
 
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
@@ -537,17 +497,16 @@ def _send_telegram_chunk(text: str) -> None:
     r.raise_for_status()
 
 
-def send_telegram(text: str) -> None:
-    # Telegram sendMessage 제한을 고려해 길면 줄 단위로 나눕니다.
-    max_len = 3800
+def _split_telegram_message(text: str, max_len: int = 3800) -> list[str]:
+    # Telegram sendMessage는 4096자 제한이 있으므로, HTML 태그 여유를 두고 3800자로 나눕니다.
     if len(text) <= max_len:
-        _send_telegram_chunk(text)
-        return
+        return [text]
 
     lines = text.splitlines()
-    chunks = []
-    current = []
+    chunks: list[str] = []
+    current: list[str] = []
     size = 0
+
     for line in lines:
         add = len(line) + 1
         if current and size + add > max_len:
@@ -557,12 +516,37 @@ def send_telegram(text: str) -> None:
         else:
             current.append(line)
             size += add
+
     if current:
         chunks.append("\n".join(current))
 
-    for i, chunk in enumerate(chunks, 1):
-        prefix = f"<b>하락장 레이더 {i}/{len(chunks)}</b>\n" if len(chunks) > 1 else ""
-        _send_telegram_chunk(prefix + chunk)
+    if len(chunks) > 1:
+        return [f"<b>하락장 레이더 {i}/{len(chunks)}</b>\n{chunk}" for i, chunk in enumerate(chunks, 1)]
+    return chunks
+
+
+def send_telegram(text: str) -> None:
+    chunks = _split_telegram_message(text)
+    chat_ids = telegram_chat_ids()
+
+    successes = 0
+    failures: list[str] = []
+
+    for chat_id in chat_ids:
+        try:
+            for chunk in chunks:
+                _send_telegram_chunk_to_chat(chunk, chat_id)
+            successes += 1
+        except Exception as e:
+            failures.append(f"{chat_id}: {sanitize_error(e)}")
+
+    if failures:
+        print("Telegram send failures:")
+        for failure in failures:
+            print("- " + failure)
+
+    if successes == 0:
+        raise RuntimeError("Telegram 전송 실패: " + " | ".join(failures))
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +564,7 @@ def main() -> None:
         ("미국 10Y 실질금리", lambda: fred_series("DFII10"), True, 8, 20, "{:.2f}%", "bps"),
         ("달러지수 프록시", lambda: fred_series("DTWEXBGS"), True, 7, 20, "{:.2f}", "pct"),
         ("원/달러", lambda: fred_series("DEXKOUS"), True, 7, 20, "{:,.0f}원", "pct"),
-        ("ISM PMI", fred_ism_pmi, False, 4, 3, "{:.1f}", "abs"),
+        ("제조업 경기 프록시(IPMAN YoY)", fred_manufacturing_activity_proxy, False, 4, 3, "{:+.2f}%", "pp"),
         ("미국 실업률", lambda: fred_series("UNRATE"), True, 4, 3, "{:.1f}%", "pp"),
     ]
 
