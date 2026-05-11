@@ -20,7 +20,6 @@ from advanced_signals import fetch_advanced_items
 
 
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
-FRED_MD_URL = "https://files.stlouisfed.org/files/htdocs/fred-md/monthly/current.csv"
 
 HISTORY_PATH = Path("data/history.csv")
 ADVANCED_CSV_PATH = Path("advanced_signals.csv")
@@ -65,8 +64,24 @@ def kst_now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
 
+def sanitize_error(text: object) -> str:
+    """Telegram 메시지에 API key가 노출되지 않도록 오류 문자열을 정리합니다."""
+    raw = str(text)
+    import re
+
+    patterns = [
+        r"(serviceKey=)[^&\s)]+",
+        r"(apikey=)[^&\s)]+",
+        r"(api_key=)[^&\s)]+",
+        r"(TELEGRAM_BOT_TOKEN=)[^&\s)]+",
+    ]
+    for pat in patterns:
+        raw = re.sub(pat, r"\1***", raw, flags=re.IGNORECASE)
+    return raw
+
+
 # ---------------------------------------------------------------------------
-# Data fetchers: FRED / FRED-MD
+# Data fetchers: FRED
 # ---------------------------------------------------------------------------
 
 
@@ -91,23 +106,13 @@ def fred_series(series_id: str, start: str = "2018-01-01") -> pd.Series:
     return s.dropna().sort_index()
 
 
-def fred_md_pmi() -> pd.Series:
-    """FRED-MD current.csv의 NAPM 컬럼을 ISM 제조업 PMI 프록시로 사용합니다."""
-    r = requests.get(FRED_MD_URL, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
+def fred_ism_pmi() -> pd.Series:
+    """ISM Manufacturing PMI Composite Index.
 
-    if "sasdate" not in df.columns:
-        raise RuntimeError("FRED-MD 파일에 sasdate 컬럼이 없습니다.")
-    if "NAPM" not in df.columns:
-        raise RuntimeError("FRED-MD 파일에 NAPM 컬럼이 없습니다.")
-
-    # FRED-MD 첫 행에 Transform 코드가 들어오는 경우가 있어 날짜 변환 실패 행은 제거합니다.
-    df["sasdate"] = pd.to_datetime(df["sasdate"], errors="coerce")
-    df = df.dropna(subset=["sasdate"])
-
-    s = pd.Series(pd.to_numeric(df["NAPM"], errors="coerce").values, index=df["sasdate"])
-    return s.dropna().sort_index()
+    예전 버전은 FRED-MD current.csv를 직접 받았지만 GitHub Actions에서 403이 날 수 있습니다.
+    그래서 FRED API의 NAPM 시리즈를 직접 사용합니다.
+    """
+    return fred_series("NAPM", start="2018-01-01")
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +409,7 @@ def render_message(
     if errors:
         lines += ["", "<b>데이터 오류/누락</b>"]
         for e in errors[:8]:
-            lines.append(f"- {html.escape(str(e))}")
+            lines.append(f"- {html.escape(sanitize_error(e))}")
         if len(errors) > 8:
             lines.append(f"- 외 {len(errors) - 8}개")
 
@@ -492,7 +497,7 @@ def main() -> None:
         ("미국 10Y 실질금리", lambda: fred_series("DFII10"), True, 8, 20, "{:.2f}%", "bps"),
         ("달러지수 프록시", lambda: fred_series("DTWEXBGS"), True, 7, 20, "{:.2f}", "pct"),
         ("원/달러", lambda: fred_series("DEXKOUS"), True, 7, 20, "{:,.0f}원", "pct"),
-        ("ISM PMI 프록시", fred_md_pmi, False, 4, 3, "{:.1f}", "abs"),
+        ("ISM PMI", fred_ism_pmi, False, 4, 3, "{:.1f}", "abs"),
         ("미국 실업률", lambda: fred_series("UNRATE"), True, 4, 3, "{:.1f}%", "pp"),
     ]
 
@@ -511,7 +516,7 @@ def main() -> None:
                 )
             )
         except Exception as e:
-            errors.append(f"{name}: {e}")
+            errors.append(sanitize_error(f"{name}: {e}"))
 
     # 자동 고급 지표: CAPEX, NVDA guidance, 반도체 수출, Forward EPS, EPS Revision
     try:
@@ -519,13 +524,13 @@ def main() -> None:
         items.extend(advanced_items)
         errors.extend(advanced_errors)
     except Exception as e:
-        errors.append(f"advanced_signals.py: {e}")
+        errors.append(sanitize_error(f"advanced_signals.py: {e}"))
 
     # 자동수집 실패 시 수동 CSV 값으로 백업 가능. 같은 이름이면 자동수집값을 우선합니다.
     try:
         items.extend(load_advanced_signals_csv())
     except Exception as e:
-        errors.append(f"advanced_signals.csv: {e}")
+        errors.append(sanitize_error(f"advanced_signals.csv: {e}"))
 
     items = dedupe_items(items)
 
@@ -552,4 +557,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
