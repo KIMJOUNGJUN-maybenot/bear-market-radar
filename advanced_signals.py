@@ -1,10 +1,4 @@
-# advanced_signals.py
-# 자동 업데이트 대상:
-# 1) 하이퍼스케일러 CAPEX: SEC companyfacts
-# 2) Nvidia 가이던스: SEC 8-K / 실적발표 문서 파싱
-# 3) 한국 반도체 수출 YoY: 관세청/공공데이터 API
-# 4) Forward EPS: FMP analyst estimates 기반 watchlist proxy
-# 5) EPS Revision Ratio: FMP EPS estimate 전회 대비 변화 기반 proxy
+
 
 from __future__ import annotations
 
