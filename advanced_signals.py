@@ -107,6 +107,19 @@ def require_env(name: str) -> str:
     return value
 
 
+def sanitize_error(text: object) -> str:
+    """오류 메시지에서 API key가 노출되지 않도록 마스킹합니다."""
+    raw = str(text)
+    patterns = [
+        r"(serviceKey=)[^&\s)]+",
+        r"(apikey=)[^&\s)]+",
+        r"(api_key=)[^&\s)]+",
+    ]
+    for pat in patterns:
+        raw = re.sub(pat, r"\1***", raw, flags=re.IGNORECASE)
+    return raw
+
+
 def today_kst() -> str:
     return datetime.now().astimezone().date().isoformat()
 
@@ -305,53 +318,105 @@ def company_capex_series(cik: str) -> pd.Series:
     return best
 
 
-def hyperscaler_capex_item() -> dict[str, Any]:
-    series = []
-    failed = []
+def _aggregate_capex_item(series_by_ticker: list[tuple[str, pd.Series]], source_label: str) -> dict[str, Any]:
+    """회사별 CAPEX TTM YoY를 먼저 계산한 뒤 TTM 규모로 가중평균합니다.
 
-    for ticker, cik in HYPERSCALERS.items():
+    회사들의 회계연도/분기 마감일이 서로 달라 공통 분기에 맞춰 합산하면 데이터가
+    부족해질 수 있습니다. 그래서 각 회사별로 TTM YoY를 계산하고, 최신 TTM 규모로
+    가중평균해 하이퍼스케일러 CAPEX 지표를 만듭니다.
+    """
+    records: list[dict[str, Any]] = []
+    failed: list[str] = []
+
+    for ticker, s in series_by_ticker:
         try:
-            s = company_capex_series(cik)
-            s = s.rename(ticker)
-            series.append(s)
+            s = s.dropna().sort_index().astype(float)
+            if len(s) < 8:
+                failed.append(f"{ticker}: 분기 CAPEX {len(s)}개")
+                continue
+
+            ttm = s.rolling(4).sum().dropna()
+            yoy = (ttm / ttm.shift(4) - 1).replace([np.inf, -np.inf], np.nan).dropna()
+
+            if len(yoy) < 2:
+                failed.append(f"{ticker}: YoY 계산 데이터 부족")
+                continue
+
+            records.append(
+                {
+                    "ticker": ticker,
+                    "ttm_latest": float(ttm.iloc[-1]),
+                    "last_yoy": float(yoy.iloc[-1]),
+                    "prev_yoy": float(yoy.iloc[-2]),
+                    "asof": str(yoy.index[-1]),
+                }
+            )
         except Exception as e:
-            failed.append(f"{ticker}: {e}")
+            failed.append(f"{ticker}: {sanitize_error(e)}")
 
-    if len(series) < 3:
-        raise RuntimeError("하이퍼스케일러 CAPEX 수집 실패: " + "; ".join(failed))
+    if len(records) < 3:
+        raise RuntimeError(f"{source_label} CAPEX 계산 가능 회사 부족: " + "; ".join(failed[:6]))
 
-    df = pd.concat(series, axis=1).sort_index()
-    total_q = df.sum(axis=1, min_count=max(3, len(series) - 1)).dropna()
-
-    if len(total_q) < 8:
-        raise RuntimeError("하이퍼스케일러 CAPEX 분기 데이터가 부족합니다.")
-
-    ttm = total_q.rolling(4).sum().dropna()
-    yoy = (ttm / ttm.shift(4) - 1).dropna()
-
-    if len(yoy) < 2:
-        raise RuntimeError("하이퍼스케일러 CAPEX YoY 계산 데이터가 부족합니다.")
-
-    last_yoy = float(yoy.iloc[-1])
-    prev_yoy = float(yoy.iloc[-2])
+    weights = np.array([max(r["ttm_latest"], 1.0) for r in records], dtype=float)
+    last_yoy = float(np.average([r["last_yoy"] for r in records], weights=weights))
+    prev_yoy = float(np.average([r["prev_yoy"] for r in records], weights=weights))
     delta = last_yoy - prev_yoy
+    total_ttm = float(sum(r["ttm_latest"] for r in records))
 
-    # YoY가 낮거나 둔화될수록 위험 증가.
     risk = 50 - last_yoy * 90 + max(0.0, -delta) * 140
     trend_z = -delta * 10
 
-    value = f"TTM YoY {last_yoy:+.1%}, TTM ${ttm.iloc[-1] / 1e9:.1f}B"
-    change = f"전분기 YoY 변화 {delta:+.1%}p"
+    value = f"가중 TTM YoY {last_yoy:+.1%}, TTM ${total_ttm / 1e9:.1f}B ({len(records)}/{len(HYPERSCALERS)}개사)"
+    change = f"{source_label}, 전분기 YoY 변화 {delta:+.1%}p"
+    if failed:
+        change += f"; 일부 제외 {len(failed)}개"
 
     return make_item(
         name="하이퍼스케일러 CAPEX",
         value=value,
         risk=risk,
         trend_z=trend_z,
-        asof=str(yoy.index[-1]),
+        asof=max(r["asof"] for r in records),
         weight=15,
         change=change,
     )
+
+
+def hyperscaler_capex_item_sec() -> dict[str, Any]:
+    series_by_ticker: list[tuple[str, pd.Series]] = []
+    failed: list[str] = []
+
+    for ticker, cik in HYPERSCALERS.items():
+        try:
+            s = company_capex_series(cik)
+            series_by_ticker.append((ticker, s))
+        except Exception as e:
+            failed.append(f"{ticker}: {sanitize_error(e)}")
+
+    if len(series_by_ticker) < 3:
+        raise RuntimeError("SEC CAPEX 수집 실패: " + "; ".join(failed[:6]))
+
+    return _aggregate_capex_item(series_by_ticker, source_label="SEC companyfacts")
+
+def hyperscaler_capex_item() -> dict[str, Any]:
+    """하이퍼스케일러 CAPEX.
+
+    FMP cash-flow-statement의 quarterly capitalExpenditure를 우선 사용합니다.
+    FMP가 안 되면 SEC companyfacts 방식으로 fallback합니다.
+    """
+    fmp_error = None
+    try:
+        return hyperscaler_capex_item_fmp()
+    except Exception as e:
+        fmp_error = e
+
+    try:
+        return hyperscaler_capex_item_sec()
+    except Exception as sec_error:
+        raise RuntimeError(
+            "FMP CAPEX 실패(" + sanitize_error(fmp_error) + "); "
+            "SEC CAPEX 실패(" + sanitize_error(sec_error) + ")"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -478,15 +543,19 @@ def _fmp_request(url: str, params: dict[str, Any]) -> Any:
     data = r.json()
     if isinstance(data, dict):
         msg = data.get("Error Message") or data.get("error") or data.get("message")
-        if msg and "limit" in str(msg).lower():
+        if msg:
             raise RuntimeError(str(msg))
     return data
 
 
 def fmp_analyst_estimates(symbol: str) -> list[dict[str, Any]]:
+    # FMP는 stable endpoint와 legacy v3 endpoint가 모두 쓰입니다.
+    # 일부 계정/플랜에서는 한쪽만 응답하므로 4가지 조합을 순차 시도합니다.
     urls = [
-        ("https://financialmodelingprep.com/stable/analyst-estimates", {"symbol": symbol}),
-        (f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}", {}),
+        ("https://financialmodelingprep.com/stable/analyst-estimates", {"symbol": symbol, "period": "quarter", "limit": 20}),
+        ("https://financialmodelingprep.com/stable/analyst-estimates", {"symbol": symbol, "period": "annual", "limit": 20}),
+        (f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}", {"period": "quarter", "limit": 20}),
+        (f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}", {"period": "annual", "limit": 20}),
     ]
 
     last_error = None
@@ -520,6 +589,66 @@ def fmp_quote(symbol: str) -> dict[str, Any] | None:
             continue
     return None
 
+
+def fmp_cash_flow_quarterly(symbol: str) -> pd.Series:
+    """FMP cash-flow-statement에서 quarterly capitalExpenditure를 가져옵니다."""
+    urls = [
+        (f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{symbol}", {"period": "quarter", "limit": 24}),
+        ("https://financialmodelingprep.com/stable/cash-flow-statement", {"symbol": symbol, "period": "quarter", "limit": 24}),
+    ]
+
+    last_error = None
+    for url, params in urls:
+        try:
+            data = _fmp_request(url, params)
+            if not isinstance(data, list) or not data:
+                continue
+
+            records = []
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                dt = pd.to_datetime(row.get("date") or row.get("fiscalDateEnding"), errors="coerce")
+                if pd.isna(dt):
+                    continue
+                capex = pick_number(
+                    row,
+                    [
+                        "capitalExpenditure",
+                        "capitalExpenditures",
+                        "paymentsToAcquirePropertyPlantAndEquipment",
+                        "paymentsToAcquireProductiveAssets",
+                    ],
+                )
+                if capex is None:
+                    continue
+                records.append({"period": dt.to_period("Q"), "capex": abs(float(capex))})
+
+            if records:
+                df = pd.DataFrame(records).drop_duplicates("period", keep="first")
+                return pd.Series(df["capex"].values, index=df["period"]).sort_index()
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(f"{symbol} FMP cash-flow-statement CAPEX 없음: {sanitize_error(last_error)}")
+
+
+def hyperscaler_capex_item_fmp() -> dict[str, Any]:
+    series_by_ticker: list[tuple[str, pd.Series]] = []
+    failed: list[str] = []
+
+    for ticker in HYPERSCALERS.keys():
+        try:
+            s = fmp_cash_flow_quarterly(ticker)
+            series_by_ticker.append((ticker, s))
+        except Exception as e:
+            failed.append(f"{ticker}: {sanitize_error(e)}")
+        time.sleep(0.05)
+
+    if len(series_by_ticker) < 3:
+        raise RuntimeError("FMP CAPEX 수집 부족: " + "; ".join(failed[:6]))
+
+    return _aggregate_capex_item(series_by_ticker, source_label="FMP cashflow")
 
 def parse_number(x: Any) -> float | None:
     if x in (None, "", "None", "null"):
@@ -789,38 +918,34 @@ def get_with_service_key(url: str, params: dict[str, Any]) -> requests.Response:
 def call_kcs_itemtrade(hs_code: str, start_ym: str, end_ym: str) -> list[dict[str, Any]]:
     key = require_env("DATA_GO_KR_SERVICE_KEY")
 
-    endpoint_param_sets = [
-        (
-            "https://apis.data.go.kr/1220000/Itemtrade/getItemtradeList",
-            [
-                {"serviceKey": key, "strtYymm": start_ym, "endYymm": end_ym, "hsSgn": hs_code, "numOfRows": "200", "pageNo": "1"},
-                {"serviceKey": key, "strtYymm": start_ym, "endYymm": end_ym, "hsCode": hs_code, "numOfRows": "200", "pageNo": "1"},
-            ],
-        ),
-        (
-            "https://openapi.customs.go.kr/openapi/service/newTradestatistics/getitemtradeList",
-            [
-                {"serviceKey": key, "searchBgnDe": start_ym, "searchEndDe": end_ym, "searchItemCd": hs_code, "numOfRows": "200", "pageNo": "1"},
-                {"serviceKey": key, "searchBgnDe": start_ym, "searchEndDe": end_ym, "hsSgn": hs_code, "numOfRows": "200", "pageNo": "1"},
-            ],
-        ),
+    # 관세청 기존 직접호출(openapi.customs.go.kr)은 GW 방식으로 대체/폐기 공지가 있었으므로
+    # data.go.kr Gateway endpoint만 사용합니다.
+    url = "https://apis.data.go.kr/1220000/Itemtrade/getItemtradeList"
+    param_sets = [
+        {"serviceKey": key, "strtYymm": start_ym, "endYymm": end_ym, "hsSgn": hs_code, "numOfRows": "200", "pageNo": "1"},
+        {"serviceKey": key, "strtYymm": start_ym, "endYymm": end_ym, "hsCode": hs_code, "numOfRows": "200", "pageNo": "1"},
     ]
 
+    last_status = None
+    last_body = ""
     last_error = None
-    for url, param_sets in endpoint_param_sets:
-        for params in param_sets:
-            try:
-                r = get_with_service_key(url, params)
-                r.raise_for_status()
-                rows = parse_export_payload(r.content, hs_hint=hs_code)
-                if rows:
-                    return rows
-            except Exception as e:
-                last_error = e
 
+    for params in param_sets:
+        try:
+            r = get_with_service_key(url, params)
+            last_status = r.status_code
+            last_body = r.content[:600].decode("utf-8", errors="ignore")
+            r.raise_for_status()
+            rows = parse_export_payload(r.content, hs_hint=hs_code)
+            if rows:
+                return rows
+        except Exception as e:
+            last_error = e
+
+    msg = f"status={last_status}, body={last_body[:300]}"
     if last_error:
-        raise RuntimeError(f"관세청 API 호출 실패: {last_error}")
-    return []
+        msg += f", error={last_error}"
+    raise RuntimeError("관세청 GW API 호출/파싱 실패: " + sanitize_error(msg))
 
 
 def korea_semiconductor_exports_item() -> dict[str, Any]:
@@ -905,11 +1030,13 @@ def forward_eps_revision_items() -> list[dict[str, Any]]:
     watchlist = load_eps_symbols()
     today = datetime.now().date().isoformat()
     current_rows = []
+    symbol_errors = []
 
     for symbol in watchlist:
         try:
             est = fmp_forward_eps(symbol)
             if not est:
+                symbol_errors.append(f"{symbol}: analyst estimates 응답 없음")
                 continue
             current_rows.append(
                 {
@@ -921,11 +1048,13 @@ def forward_eps_revision_items() -> list[dict[str, Any]]:
                 }
             )
             time.sleep(0.05)
-        except Exception:
+        except Exception as e:
+            symbol_errors.append(f"{symbol}: {sanitize_error(e)}")
             continue
 
     if not current_rows:
-        raise RuntimeError("FMP Forward EPS 데이터를 가져오지 못했습니다.")
+        detail = "; ".join(symbol_errors[:5]) if symbol_errors else "원인 로그 없음"
+        raise RuntimeError("FMP Forward EPS 데이터를 가져오지 못했습니다. FMP_API_KEY가 analyst-estimates endpoint 접근 권한이 있는지 확인하세요. " + detail)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     current = pd.DataFrame(current_rows)
@@ -1034,12 +1163,11 @@ def fetch_advanced_items() -> tuple[list[dict[str, Any]], list[str]]:
         try:
             items.append(fn())
         except Exception as e:
-            errors.append(f"{fn.__name__}: {e}")
+            errors.append(f"{fn.__name__}: {sanitize_error(e)}")
 
     try:
         items.extend(forward_eps_revision_items())
     except Exception as e:
-        errors.append(f"forward_eps_revision_items: {e}")
+        errors.append(f"forward_eps_revision_items: {sanitize_error(e)}")
 
     return items, errors
-
