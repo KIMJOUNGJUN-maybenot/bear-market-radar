@@ -1,0 +1,16 @@
+symbol,category,note
+NVDA,AI Semiconductor,Nvidia guidance and AI cycle bellwether
+MSFT,Hyperscaler,Azure AI capex exposure
+AAPL,Mega-cap Tech,Index weight and consumer tech
+AMZN,Hyperscaler,AWS and logistics capex
+GOOGL,Hyperscaler,Google Cloud and AI capex
+META,Hyperscaler,AI capex and advertising cycle
+AVGO,AI Semiconductor,AI networking and custom silicon
+AMD,AI Semiconductor,AI accelerator and CPU cycle
+TSM,Semiconductor Foundry,Global semiconductor production proxy
+ASML,Semiconductor Equipment,Semicapex cycle proxy
+ORCL,Hyperscaler,Cloud infrastructure capex
+MU,Memory Semiconductor,Memory cycle sensitivity
+QCOM,Semiconductor,Mobile and edge semiconductor cycle
+CRM,Software,Enterprise software demand
+NOW,Software,Enterprise software demand
