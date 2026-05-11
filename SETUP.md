@@ -19,6 +19,7 @@ Repository → Settings → Secrets and variables → Actions → New repository
 FRED_API_KEY
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
+TELEGRAM_CHAT_IDS   # 선택사항: 여러 명/그룹/채널로 보낼 때 사용
 SEC_USER_AGENT
 DATA_GO_KR_SERVICE_KEY
 FMP_API_KEY
@@ -63,3 +64,23 @@ name,value,risk,trend_z,asof,weight
 ```
 
 같은 이름의 지표가 자동수집되면 CSV 값은 무시됩니다.
+
+
+## 여러 명에게 Telegram 메시지 보내기
+
+가장 쉬운 방법은 GitHub Secret `TELEGRAM_CHAT_IDS`를 추가하는 것입니다. 값은 쉼표로 구분합니다.
+
+```text
+123456789,987654321,-1001234567890,@my_public_channel
+```
+
+- 개인에게 직접 보내려면 그 사람이 먼저 봇에게 `/start`를 보내야 합니다.
+- 단체방에 보내려면 봇을 그 단체방에 초대하고, 해당 단체방의 `chat_id`를 넣습니다. 보통 음수입니다.
+- 채널에 보내려면 봇을 채널 관리자로 추가한 뒤, 공개 채널은 `@channel_username`, 비공개 채널은 채널 `chat_id`를 사용합니다.
+- `TELEGRAM_CHAT_IDS`가 있으면 그 값을 우선 사용하고, 없으면 기존 `TELEGRAM_CHAT_ID` 하나만 사용합니다.
+
+## ISM PMI 관련 변경
+
+현재 FRED/FRED-MD의 최신 CSV에는 `NAPM` ISM PMI 컬럼이 없습니다. FRED-MD 변경 문서에 따르면 ISM 요청으로 `NAPM`, `NAPMNOI`, `NAPMSDI` 등 ISM 계열이 FRED-MD에서 제거되었습니다. 그래서 이 버전은 자동화를 유지하기 위해 `ISM PMI` 대신 FRED `IPMAN`의 제조업 생산 YoY를 `제조업 경기 프록시(IPMAN YoY)`로 사용합니다.
+
+정확한 ISM PMI를 꼭 쓰려면 ISM 또는 상용 데이터벤더의 별도 데이터 권한이 필요합니다.
