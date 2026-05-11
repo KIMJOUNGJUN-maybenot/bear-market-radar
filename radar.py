@@ -7,6 +7,7 @@ import html
 import io
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -106,13 +107,95 @@ def fred_series(series_id: str, start: str = "2018-01-01") -> pd.Series:
     return s.dropna().sort_index()
 
 
+FRED_MD_PAGE_URL = "https://www.stlouisfed.org/research/economists/mccracken/fred-databases"
+FRED_MD_FALLBACK_URLS = [
+    "https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md/monthly/current.csv",
+    "https://files.stlouisfed.org/files/htdocs/fred-md/monthly/current.csv",
+]
+
+
+def _http_headers() -> dict[str, str]:
+    # stlouisfed.org / files.stlouisfed.org 쪽은 GitHub Actions의 기본 user-agent를
+    # 차단하는 경우가 있어 명시적으로 넣습니다. SEC_USER_AGENT가 있으면 재사용합니다.
+    ua = os.getenv("SEC_USER_AGENT") or "bearmarket-radar/1.0 contact@example.com"
+    return {
+        "User-Agent": ua,
+        "Accept": "text/csv,application/csv,text/plain,text/html,*/*",
+    }
+
+
+def _read_fred_md_csv_from_url(url: str) -> pd.DataFrame:
+    r = requests.get(url, headers=_http_headers(), timeout=30)
+    r.raise_for_status()
+    return pd.read_csv(io.StringIO(r.text))
+
+
+def _discover_latest_fred_md_csv_url() -> str | None:
+    """St. Louis Fed의 FRED-MD 페이지에서 최신 monthly csv 링크를 찾습니다."""
+    try:
+        r = requests.get(FRED_MD_PAGE_URL, headers=_http_headers(), timeout=30)
+        r.raise_for_status()
+        html_text = r.text
+    except Exception:
+        return None
+
+    candidates: list[str] = []
+
+    # 절대 URL
+    candidates.extend(re.findall(r'https?://[^"\']+fred-md/monthly/[^"\']+?\.csv', html_text))
+
+    # 상대 URL: /-/media/project/frbstl/stlouisfed/research/fred-md/monthly/2026-04-md.csv
+    for rel in re.findall(r'href=["\']([^"\']+fred-md/monthly/[^"\']+?\.csv)', html_text):
+        if rel.startswith("http"):
+            candidates.append(rel)
+        elif rel.startswith("/"):
+            candidates.append("https://www.stlouisfed.org" + rel)
+
+    # current.csv가 있으면 우선, 없으면 최신 월별 파일 우선
+    for url in candidates:
+        if "current" in url.lower():
+            return url
+
+    dated = []
+    for url in candidates:
+        m = re.search(r'(20\d{2})-(\d{2})', url)
+        if m:
+            dated.append((m.group(0), url))
+    if dated:
+        return sorted(dated, reverse=True)[0][1]
+
+    return candidates[0] if candidates else None
+
+
 def fred_ism_pmi() -> pd.Series:
     """ISM Manufacturing PMI Composite Index.
 
-    예전 버전은 FRED-MD current.csv를 직접 받았지만 GitHub Actions에서 403이 날 수 있습니다.
-    그래서 FRED API의 NAPM 시리즈를 직접 사용합니다.
+    FRED API의 NAPM series_id는 일반 FRED series endpoint에서 400이 날 수 있습니다.
+    그래서 St. Louis Fed의 FRED-MD monthly csv에서 NAPM 컬럼을 읽습니다.
     """
-    return fred_series("NAPM", start="2018-01-01")
+    errors: list[str] = []
+    urls = list(FRED_MD_FALLBACK_URLS)
+    discovered = _discover_latest_fred_md_csv_url()
+    if discovered:
+        urls.insert(0, discovered)
+
+    seen = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            df = _read_fred_md_csv_from_url(url)
+            if "sasdate" not in df.columns or "NAPM" not in df.columns:
+                raise RuntimeError("FRED-MD CSV에 sasdate 또는 NAPM 컬럼이 없습니다.")
+            df["sasdate"] = pd.to_datetime(df["sasdate"], errors="coerce")
+            df = df.dropna(subset=["sasdate"])
+            s = pd.Series(pd.to_numeric(df["NAPM"], errors="coerce").values, index=df["sasdate"])
+            return s.dropna().sort_index()
+        except Exception as e:
+            errors.append(f"{url}: {sanitize_error(e)}")
+
+    raise RuntimeError("FRED-MD NAPM 다운로드 실패: " + " | ".join(errors[:3]))
 
 
 # ---------------------------------------------------------------------------
